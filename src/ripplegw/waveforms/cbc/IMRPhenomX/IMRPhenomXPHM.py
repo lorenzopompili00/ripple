@@ -5,6 +5,7 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Complex, Float
 
+import ripplegw.waveforms.cbc.IMRPhenomX.IMRPhenomX_NNLO as pNNLO
 import ripplegw.waveforms.cbc.IMRPhenomX.LALSimIMRPhenomX_precession as pPrec
 from ripplegw.constants import MPC, MRSUN, MTSUN
 from ripplegw.conversions import Mc_eta_to_ms
@@ -90,8 +91,18 @@ def generate_xphm(
     phi0: FloatLike,
     frequency_array: Float[Array, " n_freq"],
     reference_frequency: float,
+    msa_fallback: bool = True,
 ) -> tuple[Complex[Array, " n_freq"], Complex[Array, " n_freq"]]:
-    """Generate IMRPhenomXPHM plus and cross polarizations."""
+    """Generate IMRPhenomXPHM plus and cross polarizations.
+
+    Args:
+        msa_fallback: Matches LAL: on MSA_ERROR (the MSA system fails to
+            initialise, |Omega_z^(5)| > 1000), use the NNLO angles
+            (PrecVersion 102) instead of the MSA angles (PrecVersion 223); see
+            IMRPhenomX_NNLO.  Both branches are evaluated and selected per
+            binary with jnp.where.  Default True; False gives the MSA angles
+            for every binary (ripple's behaviour before the fallback).
+    """
     # LAL: Mf = pWF->M_sec * f with M_sec built from round-tripped solar masses;
     # the ULP matters because Mf feeds the near-degenerate MSA S^2 cubic.
     Mf: Float[Array, " n_freq"] = frequency_array * lal_M_sec(mass_1, mass_2)
@@ -133,6 +144,20 @@ def generate_xphm(
         msa_S1L_pav=_msa_init[32],
         msa_S2L_pav=_msa_init[33],
     )
+    if msa_fallback:
+        pWF22 = pNNLO.select_fallback_pWF22(
+            pWF22,
+            pNNLO.msa_error_from_init(_msa_init),
+            mass_1,
+            mass_2,
+            chi1x,
+            chi1y,
+            chi1z,
+            chi2x,
+            chi2y,
+            chi2z,
+            reference_frequency,
+        )
     hlm_dict = XLALSimIMRPhenomXHMGethlmModes(
         Mf, pWF22, phi0=0.0, ell_mm_pairs=_ell_mm_pairs
     )
@@ -161,6 +186,7 @@ def generate_xphm(
         inclination,
         reference_frequency,
         hlms,
+        msa_fallback=msa_fallback,
     )
 
     return hp, hc
@@ -180,6 +206,7 @@ def twistup(
     inclination: FloatLike,
     reference_frequency: float,
     hlm: Complex[Array, "n_modes n_freq"],
+    msa_fallback: bool = True,
 ) -> tuple[Complex[Array, " n_freq"], Complex[Array, " n_freq"]]:
     """
     Rotate the co-precessing frame hlm modes into the inertial (J-frame) polarisations hp, hc.
@@ -197,6 +224,9 @@ def twistup(
         inclination: Inclination angle between J and line of sight (rad).
         reference_frequency: Reference frequency for spin evolution (Hz).
         hlm: Co-precessing frame modes, shape (n_modes, N).
+        msa_fallback: Matches LAL: on MSA_ERROR, use the NNLO angles and
+            J-frame (PrecVersion 102); see IMRPhenomX_NNLO.apply_msa_fallback.
+            Default True; False uses the MSA angles for every binary.
 
     Returns:
         hp, hc: Plus and cross polarisations, shape (N,).
@@ -292,6 +322,29 @@ def twistup(
     alpha_all = _batched_angles[0]  # (4, N)
     eps_all = _batched_angles[1]  # (4, N)
     cos_beta_all = _batched_angles[2]  # (4, N)
+    if msa_fallback:
+        theta_JN, zeta_polarisations, alpha_all, eps_all, cos_beta_all = (
+            pNNLO.apply_msa_fallback(
+                Mf,
+                jnp.array([1, 2, 3, 4]),
+                mass_1,
+                mass_2,
+                chi1x,
+                chi1y,
+                chi1z,
+                chi2x,
+                chi2y,
+                chi2z,
+                phiRef_In,
+                inclination,
+                reference_frequency,
+                theta_JN,
+                zeta_polarisations,
+                alpha_all,
+                eps_all,
+                cos_beta_all,
+            )
+        )
 
     # Unpack per-emm results
     alpha_1, alpha_2, alpha_3, alpha_4 = alpha_all
@@ -911,16 +964,22 @@ class IMRPhenomXPHM(FrequencyDomainWaveform, DistanceScaledWaveform):
 
     Attributes:
         f_ref (float): Reference frequency in Hz.
+        msa_fallback (bool): Use LAL's MSA -> NNLO angle fallback (default).
     """
 
     f_ref: float
+    msa_fallback: bool
 
-    def __init__(self, f_ref: float = 20.0) -> None:
+    def __init__(self, f_ref: float = 20.0, msa_fallback: bool = True) -> None:
         """
         Args:
             f_ref (float): Reference frequency in Hz. Defaults to 20.0.
+            msa_fallback (bool): Matches LAL: on MSA_ERROR, use the NNLO angles
+                (PrecVersion 102), as LAL does for its default PrecVersion 223.
+                Defaults to True; False uses the MSA angles for every binary.
         """
         self.f_ref = f_ref
+        self.msa_fallback = msa_fallback
 
     @property
     def parameter_names(self) -> tuple[str, ...]:
@@ -968,8 +1027,9 @@ class IMRPhenomXPHM(FrequencyDomainWaveform, DistanceScaledWaveform):
             params["phase_c"],
             frequency,
             self.f_ref,
+            msa_fallback=self.msa_fallback,
         )
         return {"p": hp, "c": hc}
 
     def __repr__(self):
-        return f"IMRPhenomXPHM(f_ref={self.f_ref})"
+        return f"IMRPhenomXPHM(f_ref={self.f_ref}, msa_fallback={self.msa_fallback})"

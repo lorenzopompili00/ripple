@@ -702,6 +702,9 @@ def IMRPhenomX_Initialize_MSA_System(
             S2_norm_2,
             S1L_pav,
             S2L_pav,
+            # Raw Omega_z^(5) (Eq. D15), before the expansion-order truncation:
+            # LAL sets MSA_ERROR when |Omegaz5| > 1000 (see IMRPhenomX_NNLO).
+            Omegaz5,
         ]
     )
 

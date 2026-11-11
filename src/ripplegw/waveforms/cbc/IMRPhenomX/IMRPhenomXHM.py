@@ -2029,7 +2029,7 @@ def _xhm_s2s_complex(
     """
     amp22, _ = get_mergerringdown_Amp(Mf, theta, amp_coeffs_22, chip=chip)
     phi22 = IMRPhenomXAS_Phase(Mf / M_s, theta, phase_coeffs, chip) + t0 * Mf + phifRef
-    wf22R = amp22 * ampNorm * Mf ** (-7.0 / 6.0) * jnp.exp(1j * phi22)
+    wf22R = amp22 * ampNorm * Mf ** (-7.0 / 6.0) * IMRPhenomX_utils.cexpi(phi22)
 
     # amplm: 3-region spheroidal amplitude
     amplm_lor = _xhm_rd_rescaled_v1(Mf, alambda32, lambda32, sigma32, fRING32, fDAMP32)
@@ -2052,7 +2052,9 @@ def _xhm_s2s_complex(
         Mf, alpha0_S, alphaL_S, alpha2_S, alpha4_S, phi0_S, fRING32, fDAMP32
     )
 
-    return jnp.conj(mu322) * wf22R + jnp.conj(mu323) * amplm * jnp.exp(1j * philm)
+    return jnp.conj(mu322) * wf22R + jnp.conj(mu323) * amplm * IMRPhenomX_utils.cexpi(
+        philm
+    )
 
 
 def _compute_32_hlm(
@@ -2527,7 +2529,7 @@ def _compute_32_hlm(
             phase_ins(Mf),
             jnp.where(Mf < fMatchIM, phase_inter(Mf), phase_rd(Mf)),
         )
-        return amp * jnp.exp(1j * (ph - emm * phi0))
+        return amp * IMRPhenomX_utils.cexpi(ph - emm * phi0)
 
     return jax.vmap(hlm_at)(freqs_geom)
 
@@ -6640,7 +6642,7 @@ def XLALSimIMRPhenomXHMEvaluateOnehlmMode(
     # xhm_phase_noModeMixing already encodes t0 through the intermediate collocation
     # derivatives (all_vals = fits + t0) and C1INSP.
     phase_total = phase_lm - emm * phi0
-    return amp_lm * jnp.exp(1j * phase_total)
+    return amp_lm * IMRPhenomX_utils.cexpi(phase_total)
 
 
 def XLALSimIMRPhenomXHMGethlmModes(
@@ -6712,7 +6714,7 @@ def XLALSimIMRPhenomXHMGethlmModes(
             # 22 mode: phifRef already encodes 2*phi0, so no extra subtraction needed.
             # LAL: Psi_22 = t0*(f-Mf_ref) + phase_22 - phi_22_at_ref + 2*phi0 + PI/4
             phase_total = t0 * freqs_geom + phase_22 + phifRef
-            hlm_dict[(ell, mm)] = amp_22 * jnp.exp(1j * phase_total)
+            hlm_dict[(ell, mm)] = amp_22 * IMRPhenomX_utils.cexpi(phase_total)
         else:
             pWFHM = xhm_set_waveform_variables(ell, mm, pWF22)
             if pWFHM.MixingOn:

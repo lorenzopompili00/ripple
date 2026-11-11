@@ -6,6 +6,7 @@ plugin -- a subdirectory conftest's options are invisible once the run is
 anchored at ``testpaths = ["tests"]``.
 """
 
+import os
 from functools import cache
 from pathlib import Path
 
@@ -13,6 +14,21 @@ import jax
 import pytest
 
 jax.config.update("jax_enable_x64", True)
+
+# Persistent XLA compilation cache for the test session (also used by
+# tests/helpers/xphm.compiled for exported modules). Directory: $RIPPLE_TEST_JAX_CACHE,
+# else $JAX_COMPILATION_CACHE_DIR, else <repo>/.jax-cache; set RIPPLE_TEST_JAX_CACHE=""
+# to disable. Safe with pytest-xdist (the cache writes are atomic).
+_JAX_CACHE = os.environ.get(
+    "RIPPLE_TEST_JAX_CACHE",
+    os.environ.get(
+        "JAX_COMPILATION_CACHE_DIR",
+        str(Path(__file__).resolve().parents[1] / ".jax-cache"),
+    ),
+)
+if _JAX_CACHE:
+    jax.config.update("jax_compilation_cache_dir", _JAX_CACHE)
+    jax.config.update("jax_persistent_cache_min_compile_time_secs", 0.0)
 
 import ripplegw
 from tests.helpers.config import default_config
@@ -135,3 +151,13 @@ def compiled_model():
         return _jit_method(name, tuple(sorted(config.items())), method)
 
     return _get
+
+
+def pytest_collection_modifyitems(config, items):
+    """Skip ``gpu``-marked tests when JAX has no GPU backend."""
+    if jax.default_backend() == "gpu":
+        return
+    skip = pytest.mark.skip(reason="needs a GPU (JAX default backend is not gpu)")
+    for item in items:
+        if "gpu" in item.keywords:
+            item.add_marker(skip)

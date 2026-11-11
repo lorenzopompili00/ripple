@@ -41,6 +41,8 @@ test = [
     "coveralls>=4.0.1",
     "pytest>=8.3.3",
     "pytest-cov>=6.0.0",
+    "pytest-xdist>=3.6",
+    "flatbuffers>=24.3",  # jax.export serialization (tests/helpers/xphm.compiled)
     "ruff>=0.12.2",
     "tqdm>=4.66.0",
 ]
@@ -83,7 +85,10 @@ markers = [
     "accuracy: compares waveform output against its registered reference calculation",
     "smoke: accuracy checks cheap enough to run on every CI gate (few parameter draws)",
     "slow: heavy paths on very large models; runs on main and release, skipped by -m 'not slow'",
+    "gpu: large accuracy/throughput checks that need a GPU (skipped without one)",
 ]
+# Default run = quick tier; select the others explicitly, e.g. -m slow or -m "slow or gpu".
+addopts = ["-m", "not slow and not gpu"]
 
 [tool.ruff]
 # Classify the installed package separately from third-party dependencies.

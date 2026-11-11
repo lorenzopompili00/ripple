@@ -27,6 +27,7 @@ from ripplegw.waveforms.cbc.IMRPhenomX.IMRPhenomXPHM import (
 from ripplegw.waveforms.cbc.IMRPhenomX.initialize_MSA_system import (
     IMRPhenomX_Initialize_MSA_System,
 )
+from tests.helpers.xphm import compiled
 
 F_REF = 20.0
 FREQS = np.arange(20.0, 1024.0, 0.5)
@@ -36,27 +37,29 @@ FLAGGED = np.asarray(_DRAWS["msa_error"])
 CONTROL = np.asarray(_DRAWS["control"])
 
 
-def _batched(**kwargs):
-    fn = lambda theta, f: generate_xphm(*theta, f, F_REF, **kwargs)
-    return jax.jit(jax.vmap(fn, in_axes=(0, None)))
-
-
-def _run(**kwargs):
+def _run(name, **kwargs):
+    """jit(vmap(generate_xphm)) on the flagged then the control draws, compiled
+    once and cached on disk (tests/helpers/xphm.compiled)."""
     theta = jnp.asarray(np.concatenate([FLAGGED, CONTROL]))
-    hp, hc = _batched(**kwargs)(theta, jnp.asarray(FREQS))
+    f = jnp.asarray(FREQS)
+
+    def fn(th):
+        return jax.vmap(lambda t: generate_xphm(*t, f, F_REF, **kwargs))(th)
+
+    hp, hc = compiled(name, fn, theta)(theta)
     return np.asarray(hp), np.asarray(hc)
 
 
 @pytest.fixture(scope="module")
 def fallback_waveforms():
     """Default call (msa_fallback=True) on the flagged then the control draws."""
-    return _run()
+    return _run("nnlo_fallback_default")
 
 
 @pytest.fixture(scope="module")
 def msa_only_waveforms():
     """msa_fallback=False on the flagged then the control draws."""
-    return _run(msa_fallback=False)
+    return _run("nnlo_msa_only", msa_fallback=False)
 
 
 def _mismatch(hp, hc, lp, lc):
@@ -212,8 +215,10 @@ def test_class_keyword():
     assert IMRPhenomXPHM().msa_fallback is True
     assert IMRPhenomXPHM(msa_fallback=False).msa_fallback is False
     f = jnp.asarray(FREQS[::8])
-    out = jax.jit(wf.__call__)(f, params)
-    ref = jax.jit(lambda x: generate_xphm(*x, f, F_REF))(jnp.asarray(FLAGGED[0]))
+    params = {k: jnp.asarray(v) for k, v in params.items()}
+    out = compiled("nnlo_class_call", lambda p: wf(f, p), params)(params)
+    x0 = jnp.asarray(FLAGGED[0])
+    ref = compiled("nnlo_class_ref", lambda x: generate_xphm(*x, f, F_REF), x0)(x0)
     np.testing.assert_allclose(
         out["p"], ref[0], rtol=1e-6, atol=1e-6 * np.abs(ref[0]).max()
     )

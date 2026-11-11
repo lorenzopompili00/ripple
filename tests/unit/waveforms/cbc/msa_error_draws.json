@@ -1,5 +1,5 @@
 {
- "description": "IMRPhenomXPHM draws where LAL's MSA initialisation fails (|Omega_z^(5)| > 1000, MSA_ERROR) and control draws where it does not. Drawn from the DINGO 8 s prior box (Dingo-Pop v2 scripts/wf_common.sample_prior(12288, seed=5)); masses in Msun, distance in Mpc, f_ref = 20 Hz.",
+ "description": "IMRPhenomXPHM draws where LAL's MSA initialisation fails (|Omega_z^(5)| > 1000, MSA_ERROR) and control draws where it does not. Drawn from a BBH box (12288 draws: chirp mass 15-150 Msun log-uniform, component masses 10-120 Msun, q >= 1/8, isotropic spins with magnitude <= 0.99, isotropic inclination, distance 100 Mpc - 20 Gpc uniform in volume); masses in Msun, distance in Mpc, f_ref = 20 Hz.",
  "keys": [
   "mass_1",
   "mass_2",

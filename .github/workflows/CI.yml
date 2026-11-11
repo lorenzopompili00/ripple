@@ -42,7 +42,6 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Cache XLA compilations
-        if: matrix.test_suite != 'unit'
         uses: actions/cache@v6
         with:
           path: .jax-cache
@@ -64,9 +63,11 @@ jobs:
             integration) test_path=tests/integration ;;
             cross-validation) test_path=tests/cross_validation ;;
           esac
-          markexpr="not accuracy"
-          if [[ "${{ matrix.test_suite }}" == "integration" && "${{ github.ref }}" != "refs/heads/main" && "${{ github.event_name }}" != "release" ]]; then
-            markexpr="not accuracy and not slow"
+          markexpr="not accuracy and not gpu"
+          if [[ "${{ matrix.test_suite }}" == "unit" ]]; then
+            markexpr="not accuracy and not slow and not gpu"
+          elif [[ "${{ matrix.test_suite }}" == "integration" && "${{ github.ref }}" != "refs/heads/main" && "${{ github.event_name }}" != "release" ]]; then
+            markexpr="not accuracy and not slow and not gpu"
           fi
           cov_flags=""
           [[ "${{ matrix.python-version }}" == "3.13" ]] && cov_flags="--cov=ripplegw --cov-report="

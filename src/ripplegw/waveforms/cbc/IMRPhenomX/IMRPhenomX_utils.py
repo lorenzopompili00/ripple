@@ -1,13 +1,24 @@
 from typing import Optional
 
+import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Float
+from jaxtyping import Array, Complex, Float
 
 from ripplegw.constants import MTSUN, PI
 from ripplegw.typing import FloatLike
 
 # Dimensionless cutoff frequency for PhenomXAS
 fM_CUT = 0.3
+
+
+def cexpi(x: Float[Array, "..."] | FloatLike) -> Complex[Array, "..."]:
+    """exp(i*x) for real x, built from cos and sin.
+
+    Returns the same values as ``jnp.exp(1j * x)``: XLA lowers the complex
+    exponential to exp(Re) * (cos(Im) + i sin(Im)), and exp(0) is exactly 1, so
+    skipping it changes nothing but saves one real exponential per element.
+    """
+    return jax.lax.complex(jnp.cos(x), jnp.sin(x))
 
 
 def get_cutoff_fMs(

@@ -17,6 +17,7 @@ from ripplegw.utils.spherical_harmonics import (
     compute_sminus2_l3,
     compute_sminus2_l4,
 )
+from ripplegw.waveforms.cbc.IMRPhenomX import IMRPhenomX_utils
 from ripplegw.waveforms.cbc.IMRPhenomX.IMRPhenomXHM import (
     XLALSimIMRPhenomXHMGethlmModes,
     build_pWF22,
@@ -25,6 +26,9 @@ from ripplegw.waveforms.cbc.IMRPhenomX.initialize_MSA_system import (
     IMRPhenomX_Initialize_MSA_System,
     lal_M_sec,
 )
+
+# Co-precessing modes twisted up, in the order of the hlm stack in generate_xphm.
+_TWIST_MODES = ((2, 1), (2, 2), (3, 2), (3, 3), (4, 4))
 
 
 def compute_chip(
@@ -100,13 +104,70 @@ def generate_xphm(
             initialise, |Omega_z^(5)| > 1000), use the NNLO angles
             (PrecVersion 102) instead of the MSA angles (PrecVersion 223); see
             IMRPhenomX_NNLO.  Both branches are evaluated and selected per
-            binary with jnp.where.  Default True; False gives the MSA angles
-            for every binary (ripple's behaviour before the fallback).
+            binary with jnp.where, so under jax.vmap the NNLO branch runs for
+            every binary.  Default True; False gives the MSA angles for every
+            binary (ripple's behaviour before the fallback).
     """
     # LAL: Mf = pWF->M_sec * f with M_sec built from round-tripped solar masses;
     # the ULP matters because Mf feeds the near-degenerate MSA S^2 cubic.
     Mf: Float[Array, " n_freq"] = frequency_array * lal_M_sec(mass_1, mass_2)
 
+    amp0, pWF22, _ = coprecessing_setup(
+        mass_1,
+        mass_2,
+        chi1x,
+        chi1y,
+        chi1z,
+        chi2x,
+        chi2y,
+        chi2z,
+        distance,
+        reference_frequency,
+        msa_fallback=msa_fallback,
+    )
+    hlms = coprecessing_modes(Mf, pWF22) * amp0
+
+    hp, hc = twistup(
+        Mf,
+        mass_1,
+        mass_2,
+        chi1x,
+        chi1y,
+        chi1z,
+        chi2x,
+        chi2y,
+        chi2z,
+        phi0,
+        inclination,
+        reference_frequency,
+        hlms,
+        msa_fallback=msa_fallback,
+    )
+
+    return hp, hc
+
+
+def coprecessing_setup(
+    mass_1: FloatLike,
+    mass_2: FloatLike,
+    chi1x: FloatLike,
+    chi1y: FloatLike,
+    chi1z: FloatLike,
+    chi2x: FloatLike,
+    chi2y: FloatLike,
+    chi2z: FloatLike,
+    distance: FloatLike,
+    reference_frequency: float,
+    msa_fallback: bool = True,
+) -> tuple[FloatLike, dict, Array]:
+    """Per-binary inputs of the co-precessing modes.
+
+    Returns:
+        amp0: Overall amplitude prefactor (LAL's XLALSimPhenomUtilsFDamp0).
+        pWF22: XAS/XHM parameter dict (build_pWF22), with LAL's fallback final
+            spin where the MSA system fails and ``msa_fallback`` is set.
+        msa_error: LAL's MSA_ERROR flag (|Omega_z^(5)| > 1000).
+    """
     Mtot = mass_1 + mass_2
 
     # Overall amplitude prefactor from LAL's XLALSimPhenomUtilsFDamp0:
@@ -115,13 +176,9 @@ def generate_xphm(
     dist_m = distance * MPC  # distance in meters
     amp0 = Mtot * MRSUN * Mtot * MTSUN / dist_m
 
-    # Mode order: [(2,1),(2,2),(3,2),(3,3),(4,4)]
-    _ell_mm_pairs = [(2, 1), (2, 2), (3, 2), (3, 3), (4, 4)]
-
     # Use XHM (PhenomXAS-based) modes as the co-precessing seed — matches LAL
     # default (TwistPhenomHM=0) and Bilby. XHM uses IMRPhenomX_TimeShift_22 for
     # the t0 convention, which is the correct PE coalescence-time reference.
-    # phi0=0.0 follows LAL convention=1 (pWF->phi0 = 0 for the co-precessing modes).
     # Use MSA-averaged afinal_prec (fsflag=3) for PrecVersion=222, matching LAL default.
     _msa_init = IMRPhenomX_Initialize_MSA_System(
         mass_1=mass_1,
@@ -144,10 +201,11 @@ def generate_xphm(
         msa_S1L_pav=_msa_init[32],
         msa_S2L_pav=_msa_init[33],
     )
+    msa_error = pNNLO.msa_error_from_init(_msa_init)
     if msa_fallback:
         pWF22 = pNNLO.select_fallback_pWF22(
             pWF22,
-            pNNLO.msa_error_from_init(_msa_init),
+            msa_error,
             mass_1,
             mass_2,
             chi1x,
@@ -158,42 +216,29 @@ def generate_xphm(
             chi2z,
             reference_frequency,
         )
+    return amp0, pWF22, msa_error
+
+
+def coprecessing_modes(
+    Mf: Float[Array, " n_freq"], pWF22: dict
+) -> Complex[Array, "5 n_freq"]:
+    """Co-precessing XHM modes (21, 22, 32, 33, 44), shape (5, N), without amp0.
+
+    phi0=0.0 follows LAL convention=1 (pWF->phi0 = 0 for the co-precessing modes);
+    odd-ell modes carry ripple's (-1)^ell sign.
+    """
     hlm_dict = XLALSimIMRPhenomXHMGethlmModes(
-        Mf, pWF22, phi0=0.0, ell_mm_pairs=_ell_mm_pairs
+        Mf, pWF22, phi0=0.0, ell_mm_pairs=list(_TWIST_MODES)
+    )
+    return jnp.stack(
+        [
+            (-1 if ell % 2 != 0 else 1) * hlm_dict[(ell, mm)]
+            for (ell, mm) in _TWIST_MODES
+        ]
     )
 
-    hlms = (
-        jnp.stack(
-            [
-                (-1 if ell % 2 != 0 else 1) * hlm_dict[(ell, mm)]
-                for (ell, mm) in _ell_mm_pairs
-            ]
-        )
-        * amp0
-    )
 
-    hp, hc = twistup(
-        Mf,
-        mass_1,
-        mass_2,
-        chi1x,
-        chi1y,
-        chi1z,
-        chi2x,
-        chi2y,
-        chi2z,
-        phi0,
-        inclination,
-        reference_frequency,
-        hlms,
-        msa_fallback=msa_fallback,
-    )
-
-    return hp, hc
-
-
-def twistup(
-    Mf: Float[Array, " n_freq"] | FloatLike,
+def precession_frame(
     mass_1: FloatLike,
     mass_2: FloatLike,
     chi1x: FloatLike,
@@ -205,42 +250,12 @@ def twistup(
     phiRef_In: FloatLike,
     inclination: FloatLike,
     reference_frequency: float,
-    hlm: Complex[Array, "n_modes n_freq"],
-    msa_fallback: bool = True,
-) -> tuple[Complex[Array, " n_freq"], Complex[Array, " n_freq"]]:
-    """
-    Rotate the co-precessing frame hlm modes into the inertial (J-frame) polarisations hp, hc.
-    Implementation follows the lalsimulation function IMRPhenomXPHMTwistUps.
-
-    Computes the precession angles (alpha, beta, epsilon) at each frequency via MSA,
-    applies the per-mode Wigner-d rotation and spherical-harmonic projection, sums over
-    modes (21, 22, 32, 33, 44), and applies a final polarisation rotation by zeta.
-
-    Args:
-        Mf: Dimensionless frequency array (len N).
-        mass_1, mass_2: Component masses in solar masses.
-        chi1x/y/z, chi2x/y/z: Dimensionless spin components in the L-frame.
-        phiRef_In: Reference orbital phase (rad).
-        inclination: Inclination angle between J and line of sight (rad).
-        reference_frequency: Reference frequency for spin evolution (Hz).
-        hlm: Co-precessing frame modes, shape (n_modes, N).
-        msa_fallback: Matches LAL: on MSA_ERROR, use the NNLO angles and
-            J-frame (PrecVersion 102); see IMRPhenomX_NNLO.apply_msa_fallback.
-            Default True; False uses the MSA angles for every binary.
+) -> tuple[FloatLike, FloatLike, pPrec.MSAPrecessionSetup, FloatLike]:
+    """Per-binary precession quantities of the twist-up (PrecVersion 223).
 
     Returns:
-        hp, hc: Plus and cross polarisations, shape (N,).
+        theta_JN, zeta_polarisation, MSA precession setup, twist cutoff in Mf.
     """
-
-    # We are not using multibanding for angles.
-    # Default in lalsimulation is True but I will force it to False
-
-    # Check PrecVersion
-    # Available options 101, 102, 103, 104, 220, 221, 222, 223, 224, 310, 311, 320, 321, 330
-    # I will use 223 which is default in lalsimulation
-
-    # Modes 21, 22, 32, 33, 43, 44 in that order
-
     bigM = 1
     eta = mass_1 * mass_2 / jnp.power(mass_1 + mass_2, 2)
     eta2 = jnp.power(eta, 2)
@@ -313,11 +328,40 @@ def twistup(
         kappa,
         phiJ_Sf,
     )
+    # LALSim zeroes the contribution above Mf = f_max_prime*M_sec — inclusive
+    # comparison, fCutDef in {0.3, 0.33}; see mf_twist_cutoff.
+    mf_cut = pPrec.mf_twist_cutoff(eta, chi1z, chi2z, lal_M_sec(mass_1, mass_2))
+    return theta_JN, zeta_polarisations, _msa_setup, mf_cut
+
+
+def precession_angles(
+    Mf: Float[Array, " n_freq"] | FloatLike,
+    mass_1: FloatLike,
+    mass_2: FloatLike,
+    chi1x: FloatLike,
+    chi1y: FloatLike,
+    chi1z: FloatLike,
+    chi2x: FloatLike,
+    chi2y: FloatLike,
+    chi2z: FloatLike,
+    phiRef_In: FloatLike,
+    inclination: FloatLike,
+    reference_frequency: float,
+    theta_JN: FloatLike,
+    zeta_polarisations: FloatLike,
+    msa_setup: pPrec.MSAPrecessionSetup,
+    msa_fallback: bool = True,
+) -> tuple:
+    """(theta_JN, zeta, alpha, epsilon, cos_beta) for emm = 1..4, shapes (4, N).
+
+    MSA angles. Where the MSA system fails and ``msa_fallback`` is set, the
+    NNLO frame and angles replace them.
+    """
     # Compute precession angles for all 4 unique emm values in a single batched call.
     # Modes 22 and 32 share emm=2, so we only need emm = 1, 2, 3, 4.
     _batched_angles = jax.vmap(
         pPrec.compute_evolved_spin_given_setup, in_axes=(None, 0, None)
-    )(Mf, jnp.array([1, 2, 3, 4]), _msa_setup)
+    )(Mf, jnp.array([1, 2, 3, 4]), msa_setup)
     # _batched_angles is a tuple of 3 arrays, each shape (4, N_freq)
     alpha_all = _batched_angles[0]  # (4, N)
     eps_all = _batched_angles[1]  # (4, N)
@@ -345,58 +389,150 @@ def twistup(
                 cos_beta_all,
             )
         )
+    return theta_JN, zeta_polarisations, alpha_all, eps_all, cos_beta_all
 
-    # Unpack per-emm results
-    alpha_1, alpha_2, alpha_3, alpha_4 = alpha_all
-    eps_1, eps_2, eps_3, eps_4 = eps_all
 
-    # Compute Wigner-d coefficients for all 4 emm values at once
-    cBetah_all, sBetah_all = IMRPhenomXWignerdCoefficients_cosbeta(cos_beta_all)
+def twistup(
+    Mf: Float[Array, " n_freq"] | FloatLike,
+    mass_1: FloatLike,
+    mass_2: FloatLike,
+    chi1x: FloatLike,
+    chi1y: FloatLike,
+    chi1z: FloatLike,
+    chi2x: FloatLike,
+    chi2y: FloatLike,
+    chi2z: FloatLike,
+    phiRef_In: FloatLike,
+    inclination: FloatLike,
+    reference_frequency: float,
+    hlm: Complex[Array, "n_modes n_freq"],
+    msa_fallback: bool = True,
+) -> tuple[Complex[Array, " n_freq"], Complex[Array, " n_freq"]]:
+    """
+    Rotate the co-precessing frame hlm modes into the inertial (J-frame) polarisations hp, hc.
+    Implementation follows the lalsimulation function IMRPhenomXPHMTwistUps.
 
-    # Mode 21 – emm = 1
-    beta_powers_1 = BetaPowers.from_half_angle_trig(cBetah_all[0], sBetah_all[0])
-    hp_21, hc_21 = twist_21(jnp.exp(1j * alpha_1), theta_JN, beta_powers_1)
+    Computes the precession angles (alpha, beta, epsilon) at each frequency via MSA,
+    applies the per-mode Wigner-d rotation and spherical-harmonic projection, sums over
+    modes (21, 22, 32, 33, 44), and applies a final polarisation rotation by zeta.
+    PrecVersion 223 (LAL's default); no multibanding of the angles.
 
-    # Modes 22 and 32 – both use emm = 2
-    beta_powers_2 = BetaPowers.from_half_angle_trig(cBetah_all[1], sBetah_all[1])
-    cexp_i_alpha_2 = jnp.exp(1j * alpha_2)
-    hp_22, hc_22 = twist_22(cexp_i_alpha_2, theta_JN, beta_powers_2)
-    hp_32, hc_32 = twist_32(cexp_i_alpha_2, theta_JN, beta_powers_2)
+    Args:
+        Mf: Dimensionless frequency array (len N).
+        mass_1, mass_2: Component masses in solar masses.
+        chi1x/y/z, chi2x/y/z: Dimensionless spin components in the L-frame.
+        phiRef_In: Reference orbital phase (rad).
+        inclination: Inclination angle between J and line of sight (rad).
+        reference_frequency: Reference frequency for spin evolution (Hz).
+        hlm: Co-precessing frame modes, shape (n_modes, N).
+        msa_fallback: Matches LAL: on MSA_ERROR, use the NNLO angles and
+            J-frame (PrecVersion 102); see IMRPhenomX_NNLO.apply_msa_fallback.
+            Selected with jnp.where: under jax.vmap both branches run for every
+            binary (see generate_xphm). Default True; False uses the MSA angles
+            for every binary.
 
-    # Mode 33 – emm = 3
-    beta_powers_3 = BetaPowers.from_half_angle_trig(cBetah_all[2], sBetah_all[2])
-    hp_33, hc_33 = twist_33(jnp.exp(1j * alpha_3), theta_JN, beta_powers_3)
-
-    # Mode 44 – emm = 4
-    beta_powers_4 = BetaPowers.from_half_angle_trig(cBetah_all[3], sBetah_all[3])
-    hp_44, hc_44 = twist_44(jnp.exp(1j * alpha_4), theta_JN, beta_powers_4)
-
-    # Stack into (5, N) matching the old vmap output layout
-    hp_twist_all_modes = jnp.stack([hp_21, hp_22, hp_32, hp_33, hp_44], axis=0)
-    hc_twist_all_modes = jnp.stack([hc_21, hc_22, hc_32, hc_33, hc_44], axis=0)
-    epsilon_all_modes = jnp.stack(
-        [eps_1 * 1, eps_2 * 2, eps_2 * 2, eps_3 * 3, eps_4 * 4], axis=0
+    Returns:
+        hp, hc: Plus and cross polarisations, shape (N,).
+    """
+    spins = (chi1x, chi1y, chi1z, chi2x, chi2y, chi2z)
+    theta_JN, zeta_polarisations, _msa_setup, mf_cut = precession_frame(
+        mass_1, mass_2, *spins, phiRef_In, inclination, reference_frequency
+    )
+    theta_JN, zeta_polarisations, alpha_all, eps_all, cos_beta_all = precession_angles(
+        Mf,
+        mass_1,
+        mass_2,
+        *spins,
+        phiRef_In,
+        inclination,
+        reference_frequency,
+        theta_JN,
+        zeta_polarisations,
+        _msa_setup,
+        msa_fallback=msa_fallback,
+    )
+    return twist_and_sum(
+        Mf,
+        hlm,
+        alpha_all,
+        eps_all,
+        cos_beta_all,
+        theta_JN,
+        zeta_polarisations,
+        mf_cut,
     )
 
+
+def twist_and_sum(
+    Mf: Float[Array, " n_freq"],
+    hlm: Complex[Array, "n_modes n_freq"],
+    alpha_all: Float[Array, "4 n_freq"],
+    eps_all: Float[Array, "4 n_freq"],
+    cos_beta_all: Float[Array, "4 n_freq"],
+    theta_JN: FloatLike,
+    zeta_polarisations: FloatLike,
+    mf_cut: FloatLike,
+) -> tuple[Complex[Array, " n_freq"], Complex[Array, " n_freq"]]:
+    """Frequency-dependent part of ``twistup``: Wigner-d rotation, mode sum, polarisation.
+
+    Args:
+        Mf: Dimensionless frequency array (len N).
+        hlm: Co-precessing modes (21, 22, 32, 33, 44), shape (5, N), including amp0.
+        alpha_all, eps_all, cos_beta_all: Precession angles for emm = 1..4, shape (4, N).
+        theta_JN: Angle between J and the line of sight.
+        zeta_polarisations: Polarisation rotation angle.
+        mf_cut: Twist cutoff in Mf (pPrec.mf_twist_cutoff); above it hp = hc = 0.
+
+    Returns:
+        hp, hc: Plus and cross polarisations, shape (N,).
+    """
+    # Wigner-d half-angle powers for the 4 unique emm values.
+    cBetah_all, sBetah_all = IMRPhenomXWignerdCoefficients_cosbeta(cos_beta_all)
+
+    # Twist up mode by mode and accumulate.  Modes 22 and 32 share emm = 2, so
+    # exp(i*alpha) and the beta powers are reused for them.  The mode sum is a
+    # plain Python accumulation (no (n_modes, N) stacks): under vmap XLA fuses it
+    # into a few elementwise kernels instead of materialising per-mode buffers.
+    #
     # LAL grouping (LALSimIMRPhenomXPHM.c:2192, 2204-2205):
     # eps_phase = (cexp(-mprime*i*eps) * hlm) / 2, then hp += eps_phase * hp_sum.
     # Complex multiplication is not associative, so mirror the order exactly.
-    # Accepted residual: jnp.sum's reduction order over the 5 modes (and over m
-    # inside twist_*) is XLA's choice, not LAL's sequential +=.  These sums are
-    # well-conditioned (O(1) summands, no amplification), unlike the MSA S^2
-    # cubic inputs, so the ULP is harmless and not worth chasing.
-    eps_phase = (jnp.exp(-1j * epsilon_all_modes.T) * hlm.T) / 2.0
-    _hp = jnp.sum(eps_phase * hp_twist_all_modes.T, axis=1)
-    _hc = jnp.sum(eps_phase * hc_twist_all_modes.T, axis=1)
+    # The sums over modes and over m are well-conditioned (O(1) summands, no
+    # amplification), so their summation order only matters at the ULP level.
+    _twist_fns = {
+        (2, 1): twist_21,
+        (2, 2): twist_22,
+        (3, 2): twist_32,
+        (3, 3): twist_33,
+        (4, 4): twist_44,
+    }
+    _emm_of_mode = {(2, 1): 1, (2, 2): 2, (3, 2): 2, (3, 3): 3, (4, 4): 4}
+    _per_emm: dict[int, tuple[Complex[Array, " n_freq"], BetaPowers]] = {}
+    _hp = 0.0
+    _hc = 0.0
+    for i_mode, (ell, mprime) in enumerate(_TWIST_MODES):
+        emm = _emm_of_mode[(ell, mprime)]
+        if emm not in _per_emm:
+            _per_emm[emm] = (
+                IMRPhenomX_utils.cexpi(alpha_all[emm - 1]),
+                BetaPowers.from_half_angle_trig(
+                    cBetah_all[emm - 1], sBetah_all[emm - 1]
+                ),
+            )
+        cexp_i_alpha, beta_powers = _per_emm[emm]
+        hp_sum, hc_sum = _twist_fns[(ell, mprime)](cexp_i_alpha, theta_JN, beta_powers)
+        eps_phase = (
+            IMRPhenomX_utils.cexpi(-mprime * eps_all[emm - 1]) * hlm[i_mode]
+        ) / 2.0
+        _hp = _hp + eps_phase * hp_sum
+        _hc = _hc + eps_phase * hc_sum
 
     # LALSim zeroes the contribution above Mf = f_max_prime*M_sec — inclusive
     # comparison, fCutDef in {0.3, 0.33}; see mf_twist_cutoff.  Setting
     # cos_beta=0 in compute_evolved_spin_given_setup does NOT produce a null
     # rotation (beta=pi/2 gives cBetah=sBetah=1/sqrt(2)), so we must
     # explicitly zero _hp/_hc here to match LALSim's behavior.
-    inspiral_mask = Mf <= pPrec.mf_twist_cutoff(
-        eta, chi1z, chi2z, lal_M_sec(mass_1, mass_2)
-    )
+    inspiral_mask = Mf <= mf_cut
     _hp = jnp.where(inspiral_mask, _hp, 0.0)
     _hc = jnp.where(inspiral_mask, _hc, 0.0)
 
@@ -494,6 +630,54 @@ class BetaPowers:
         )
 
 
+def _cexp_im_alpha(
+    cexp_i_alpha: Complex[Array, " n_freq"], ell: int
+) -> list[Complex[Array, " n_freq"]]:
+    """[exp(i*m*alpha) for m = -ell..ell] from exp(i*alpha).
+
+    Powers are built by repeated multiplication as before; exp(-i*alpha) is the
+    complex conjugate of exp(i*alpha) (|exp(i*alpha)| = 1 to rounding), which
+    replaces a complex division per element.
+    """
+    cexp_mi_alpha = jnp.conj(cexp_i_alpha)
+    pos = [jnp.ones_like(cexp_i_alpha), cexp_i_alpha]
+    neg = [jnp.ones_like(cexp_i_alpha), cexp_mi_alpha]
+    for _ in range(2, ell + 1):
+        pos.append(cexp_i_alpha * pos[-1])
+        neg.append(cexp_mi_alpha * neg[-1])
+    return neg[:0:-1] + pos
+
+
+def _twist_sum(
+    cexp_im_alpha: list[Complex[Array, " n_freq"]],
+    ylm: list[FloatLike],
+    d_lm: list[Float[Array, " n_freq"]],
+    d_lminus: list[Float[Array, " n_freq"]],
+    ell_odd: bool,
+) -> tuple[Complex[Array, " n_freq"], Complex[Array, " n_freq"]]:
+    """Sum over m of the Wigner-d / spherical-harmonic terms of one (ell, m') mode.
+
+    Equivalent to the vectorised form (eqs. 3.5-3.7 of the precessing paper)
+
+        A_minus = cexp_im_alpha[::-1] * d_lminus * Y
+        A_plus  = cexp_im_alpha * d_lm * conj(Y)
+        hp = sum(A_minus + s * A_plus),  hc = sum(1j * (A_minus - s * A_plus))
+
+    with s = -1 for odd ell, written as a Python sum over m so that no
+    (2*ell + 1, n_freq) intermediate arrays are created.
+    """
+    sgn = -1.0 if ell_odd else 1.0
+    n = len(cexp_im_alpha)
+    hp_sum = 0.0
+    hc_sum = 0.0
+    for k in range(n):
+        a_minus = cexp_im_alpha[n - 1 - k] * (d_lminus[k] * ylm[k])
+        a_plus = cexp_im_alpha[k] * (d_lm[k] * jnp.conj(ylm[k]))
+        hp_sum = hp_sum + (a_minus + sgn * a_plus)
+        hc_sum = hc_sum + 1j * (a_minus - sgn * a_plus)
+    return hp_sum, hc_sum
+
+
 def twist_22(
     cexp_i_alpha: Complex[Array, " n_freq"],
     theta_JN: FloatLike,
@@ -515,56 +699,19 @@ def twist_22(
         hp_sum: Plus polarization contribution
         hc_sum: Cross polarization contribution
     """
-    # Complex exponential powers of alpha
-    cexp_2i_alpha = cexp_i_alpha * cexp_i_alpha
-
-    cexp_mi_alpha = 1.0 / cexp_i_alpha
-    cexp_m2i_alpha = cexp_mi_alpha * cexp_mi_alpha
-
-    # shape (5, N): rows indexed by m+2 for m in -2..2
-    cexp_im_alpha_l2 = jnp.stack(
-        [
-            cexp_m2i_alpha,
-            cexp_mi_alpha,
-            jnp.ones_like(cexp_i_alpha),
-            cexp_i_alpha,
-            cexp_2i_alpha,
-        ],
-        axis=0,
-    )
-
-    Y2mA = jnp.array(
-        [
-            compute_sminus2_l2(theta_JN, m=-2),
-            compute_sminus2_l2(theta_JN, m=-1),
-            compute_sminus2_l2(theta_JN, m=0),
-            compute_sminus2_l2(theta_JN, m=1),
-            compute_sminus2_l2(theta_JN, m=2),
-        ]
-    )
-
-    # Wigner-d coefficients – shape (5, N)
-    d22 = jnp.array(
-        [
-            beta_powers.sBetah4,
-            2.0 * beta_powers.cBetah * beta_powers.sBetah3,
-            jnp.sqrt(6) * beta_powers.sBetah2 * beta_powers.cBetah2,
-            2.0 * beta_powers.cBetah3 * beta_powers.sBetah,
-            beta_powers.cBetah4,
-        ]
-    )
-
+    b = beta_powers
+    ylm = [compute_sminus2_l2(theta_JN, m=m) for m in range(-2, 3)]
+    # Wigner-d coefficients d^2_{m,2}, m = -2..2
+    d22 = [
+        b.sBetah4,
+        2.0 * b.cBetah * b.sBetah3,
+        jnp.sqrt(6) * b.sBetah2 * b.cBetah2,
+        2.0 * b.cBetah3 * b.sBetah,
+        b.cBetah4,
+    ]
     # Exploit symmetry d^2_{-m,-2} = (-1)^m d^2_{-m,2}. See eq. A2 of Precessing paper
-    d2m2 = jnp.array([d22[4], -d22[3], d22[2], -d22[1], d22[0]])
-
-    # Vectorised sum over m=-2..2.  The -m+2 index pattern equals reversed order.
-    # Shapes: cexp_im_alpha_l2 (5,N), d2m2 (5,N), Y2mA (5,) -> broadcast to (5,N)
-    A2m2emm = cexp_im_alpha_l2[::-1] * d2m2 * Y2mA[:, None]
-    A22emmstar = cexp_im_alpha_l2 * d22 * jnp.conj(Y2mA)[:, None]
-    hp_sum = jnp.sum(A2m2emm + A22emmstar, axis=0)
-    hc_sum = jnp.sum(1j * (A2m2emm - A22emmstar), axis=0)
-
-    return hp_sum, hc_sum
+    d2m2 = [d22[4], -d22[3], d22[2], -d22[1], d22[0]]
+    return _twist_sum(_cexp_im_alpha(cexp_i_alpha, 2), ylm, d22, d2m2, ell_odd=False)
 
 
 def twist_21(
@@ -588,58 +735,19 @@ def twist_21(
         hp_sum: Plus polarization contribution
         hc_sum: Cross polarization contribution
     """
-    # Complex exponential powers of alpha
-    cexp_2i_alpha = cexp_i_alpha * cexp_i_alpha
-    cexp_mi_alpha = 1.0 / cexp_i_alpha
-    cexp_m2i_alpha = cexp_mi_alpha * cexp_mi_alpha
-
-    # shape (5, N): rows indexed by m+2 for m in -2..2
-    cexp_im_alpha_l2 = jnp.stack(
-        [
-            cexp_m2i_alpha,
-            cexp_mi_alpha,
-            jnp.ones_like(cexp_i_alpha),
-            cexp_i_alpha,
-            cexp_2i_alpha,
-        ],
-        axis=0,
-    )
-
-    Y2mA = jnp.array(
-        [
-            compute_sminus2_l2(theta_JN, m=-2),
-            compute_sminus2_l2(theta_JN, m=-1),
-            compute_sminus2_l2(theta_JN, m=0),
-            compute_sminus2_l2(theta_JN, m=1),
-            compute_sminus2_l2(theta_JN, m=2),
-        ]
-    )
-
-    # Wigner-d coefficients for m'=1 – shape (5, N)
-    d21 = jnp.array(
-        [
-            2.0 * beta_powers.cBetah * beta_powers.sBetah3,
-            3.0 * beta_powers.cBetah2 * beta_powers.sBetah2 - beta_powers.sBetah4,
-            jnp.sqrt(6)
-            * (
-                beta_powers.cBetah3 * beta_powers.sBetah
-                - beta_powers.cBetah * beta_powers.sBetah3
-            ),
-            beta_powers.cBetah2 * (beta_powers.cBetah2 - 3.0 * beta_powers.sBetah2),
-            -2.0 * beta_powers.cBetah3 * beta_powers.sBetah,
-        ]
-    )
-
+    b = beta_powers
+    ylm = [compute_sminus2_l2(theta_JN, m=m) for m in range(-2, 3)]
+    # Wigner-d coefficients d^2_{m,1}, m = -2..2
+    d21 = [
+        2.0 * b.cBetah * b.sBetah3,
+        3.0 * b.cBetah2 * b.sBetah2 - b.sBetah4,
+        jnp.sqrt(6) * (b.cBetah3 * b.sBetah - b.cBetah * b.sBetah3),
+        b.cBetah2 * (b.cBetah2 - 3.0 * b.sBetah2),
+        -2.0 * b.cBetah3 * b.sBetah,
+    ]
     # Exploit symmetry d^2_{-m,-1} = -(-1)^m d^2_{m,1}. See eq. A2 of Precessing paper.
-    d2m1 = jnp.array([-d21[4], d21[3], -d21[2], d21[1], -d21[0]])
-
-    # Vectorised sum over m=-2..2.  The -m+2 index pattern equals reversed order.
-    A2m1emm = cexp_im_alpha_l2[::-1] * d2m1 * Y2mA[:, None]
-    A21emmstar = cexp_im_alpha_l2 * d21 * jnp.conj(Y2mA)[:, None]
-    hp_sum = jnp.sum(A2m1emm + A21emmstar, axis=0)
-    hc_sum = jnp.sum(1j * (A2m1emm - A21emmstar), axis=0)
-
-    return hp_sum, hc_sum
+    d2m1 = [-d21[4], d21[3], -d21[2], d21[1], -d21[0]]
+    return _twist_sum(_cexp_im_alpha(cexp_i_alpha, 2), ylm, d21, d2m1, ell_odd=False)
 
 
 def twist_33(
@@ -663,66 +771,24 @@ def twist_33(
         hp_sum: Plus polarization contribution
         hc_sum: Cross polarization contribution
     """
-    # Complex exponential powers of alpha
-    cexp_2i_alpha = cexp_i_alpha * cexp_i_alpha
-    cexp_3i_alpha = cexp_i_alpha * cexp_2i_alpha
-    cexp_mi_alpha = 1.0 / cexp_i_alpha
-    cexp_m2i_alpha = cexp_mi_alpha * cexp_mi_alpha
-    cexp_m3i_alpha = cexp_mi_alpha * cexp_m2i_alpha
-
-    # shape (7, N): rows indexed by m+3 for m in -3..3
-    cexp_im_alpha_l3 = jnp.stack(
-        [
-            cexp_m3i_alpha,
-            cexp_m2i_alpha,
-            cexp_mi_alpha,
-            jnp.ones_like(cexp_i_alpha),
-            cexp_i_alpha,
-            cexp_2i_alpha,
-            cexp_3i_alpha,
-        ],
-        axis=0,
-    )
-
-    Y3mA = jnp.array(
-        [
-            compute_sminus2_l3(theta=theta_JN, m=-3),
-            compute_sminus2_l3(theta=theta_JN, m=-2),
-            compute_sminus2_l3(theta=theta_JN, m=-1),
-            compute_sminus2_l3(theta=theta_JN, m=0),
-            compute_sminus2_l3(theta=theta_JN, m=1),
-            compute_sminus2_l3(theta=theta_JN, m=2),
-            compute_sminus2_l3(theta=theta_JN, m=3),
-        ]
-    )
-
-    # Wigner-d coefficients for m'=3 – shape (7, N)
+    b = beta_powers
+    ylm = [compute_sminus2_l3(theta=theta_JN, m=m) for m in range(-3, 4)]
     sqrt6 = jnp.sqrt(6.0)
     sqrt15 = jnp.sqrt(15.0)
     sqrt5 = jnp.sqrt(5.0)
-
-    d33 = jnp.array(
-        [
-            beta_powers.sBetah6,
-            sqrt6 * beta_powers.cBetah * beta_powers.sBetah5,
-            sqrt15 * beta_powers.cBetah2 * beta_powers.sBetah4,
-            2.0 * sqrt5 * beta_powers.cBetah3 * beta_powers.sBetah3,
-            sqrt15 * beta_powers.cBetah4 * beta_powers.sBetah2,
-            sqrt6 * beta_powers.cBetah5 * beta_powers.sBetah,
-            beta_powers.cBetah6,
-        ]
-    )
-
+    # Wigner-d coefficients d^3_{m,3}, m = -3..3
+    d33 = [
+        b.sBetah6,
+        sqrt6 * b.cBetah * b.sBetah5,
+        sqrt15 * b.cBetah2 * b.sBetah4,
+        2.0 * sqrt5 * b.cBetah3 * b.sBetah3,
+        sqrt15 * b.cBetah4 * b.sBetah2,
+        sqrt6 * b.cBetah5 * b.sBetah,
+        b.cBetah6,
+    ]
     # Exploit symmetry d^3_{-m,-3} = -(-1)^m d^3_{m,3}. See eq. A2 of Precessing paper.
-    d3m3 = jnp.array([d33[6], -d33[5], d33[4], -d33[3], d33[2], -d33[1], d33[0]])
-
-    # Vectorised sum over m=-3..3.  The -m+3 index pattern equals reversed order.
-    A3m3emm = cexp_im_alpha_l3[::-1] * d3m3 * Y3mA[:, None]
-    A33emmstar = cexp_im_alpha_l3 * d33 * jnp.conj(Y3mA)[:, None]
-    hp_sum = jnp.sum(A3m3emm - A33emmstar, axis=0)
-    hc_sum = jnp.sum(1j * (A3m3emm + A33emmstar), axis=0)
-
-    return hp_sum, hc_sum
+    d3m3 = [d33[6], -d33[5], d33[4], -d33[3], d33[2], -d33[1], d33[0]]
+    return _twist_sum(_cexp_im_alpha(cexp_i_alpha, 3), ylm, d33, d3m3, ell_odd=True)
 
 
 def twist_32(
@@ -746,77 +812,26 @@ def twist_32(
         hp_sum: Plus polarization contribution
         hc_sum: Cross polarization contribution
     """
-    # Complex exponential powers of alpha
-    cexp_2i_alpha = cexp_i_alpha * cexp_i_alpha
-    cexp_3i_alpha = cexp_i_alpha * cexp_2i_alpha
-    cexp_mi_alpha = 1.0 / cexp_i_alpha
-    cexp_m2i_alpha = cexp_mi_alpha * cexp_mi_alpha
-    cexp_m3i_alpha = cexp_mi_alpha * cexp_m2i_alpha
-
-    # shape (7, N): rows indexed by m+3 for m in -3..3
-    cexp_im_alpha_l3 = jnp.stack(
-        [
-            cexp_m3i_alpha,
-            cexp_m2i_alpha,
-            cexp_mi_alpha,
-            jnp.ones_like(cexp_i_alpha),
-            cexp_i_alpha,
-            cexp_2i_alpha,
-            cexp_3i_alpha,
-        ],
-        axis=0,
-    )
-
-    Y3mA = jnp.array(
-        [
-            compute_sminus2_l3(theta=theta_JN, m=-3),
-            compute_sminus2_l3(theta=theta_JN, m=-2),
-            compute_sminus2_l3(theta=theta_JN, m=-1),
-            compute_sminus2_l3(theta=theta_JN, m=0),
-            compute_sminus2_l3(theta=theta_JN, m=1),
-            compute_sminus2_l3(theta=theta_JN, m=2),
-            compute_sminus2_l3(theta=theta_JN, m=3),
-        ]
-    )
-
-    # Wigner-d coefficients for m'=2 – shape (7, N)
+    b = beta_powers
+    ylm = [compute_sminus2_l3(theta=theta_JN, m=m) for m in range(-3, 4)]
     sqrt6 = jnp.sqrt(6.0)
     sqrt10 = jnp.sqrt(10.0)
     sqrt30 = jnp.sqrt(30.0)
-
-    cBetah = beta_powers.cBetah
-    cBetah2 = beta_powers.cBetah2
-    cBetah3 = beta_powers.cBetah3
-    cBetah4 = beta_powers.cBetah4
-    cBetah5 = beta_powers.cBetah5
-    sBetah = beta_powers.sBetah
-    sBetah2 = beta_powers.sBetah2
-    sBetah3 = beta_powers.sBetah3
-    sBetah4 = beta_powers.sBetah4
-    sBetah5 = beta_powers.sBetah5
-
-    d32 = jnp.array(
-        [
-            sqrt6 * cBetah * sBetah5,
-            sBetah4 * (5.0 * cBetah2 - sBetah2),
-            sqrt10 * sBetah3 * (2.0 * cBetah3 - cBetah * sBetah2),
-            sqrt30 * cBetah2 * (cBetah2 - sBetah2) * sBetah2,
-            sqrt10 * cBetah3 * (cBetah2 * sBetah - 2.0 * sBetah3),
-            cBetah4 * (cBetah2 - 5.0 * sBetah2),
-            -1.0 * sqrt6 * cBetah5 * sBetah,
-        ]
-    )
-
+    c1, c2, c3, c4, c5 = b.cBetah, b.cBetah2, b.cBetah3, b.cBetah4, b.cBetah5
+    s1, s2, s3, s4, s5 = b.sBetah, b.sBetah2, b.sBetah3, b.sBetah4, b.sBetah5
+    # Wigner-d coefficients d^3_{m,2}, m = -3..3
+    d32 = [
+        sqrt6 * c1 * s5,
+        s4 * (5.0 * c2 - s2),
+        sqrt10 * s3 * (2.0 * c3 - c1 * s2),
+        sqrt30 * c2 * (c2 - s2) * s2,
+        sqrt10 * c3 * (c2 * s1 - 2.0 * s3),
+        c4 * (c2 - 5.0 * s2),
+        -1.0 * sqrt6 * c5 * s1,
+    ]
     # Exploit symmetry d^3_{-m,-2} = (-1)^m d^3_{m,2}. See eq. A2 of Precessing paper.
-    d3m2 = jnp.array([-d32[6], d32[5], -d32[4], d32[3], -d32[2], d32[1], -d32[0]])
-
-    # Vectorised sum over m=-3..3.  The -m+3 index pattern equals reversed order.
-    A3m2emm = cexp_im_alpha_l3[::-1] * d3m2 * Y3mA[:, None]
-    A32emmstar = cexp_im_alpha_l3 * d32 * jnp.conj(Y3mA)[:, None]
-    hp_sum = jnp.sum(A3m2emm - A32emmstar, axis=0)
-    hc_sum = jnp.sum(1j * (A3m2emm + A32emmstar), axis=0)
-
-    return hp_sum, hc_sum
+    d3m2 = [-d32[6], d32[5], -d32[4], d32[3], -d32[2], d32[1], -d32[0]]
+    return _twist_sum(_cexp_im_alpha(cexp_i_alpha, 3), ylm, d32, d3m2, ell_odd=True)
 
 
 def twist_44(
@@ -840,77 +855,27 @@ def twist_44(
         hp_sum: Plus polarization contribution
         hc_sum: Cross polarization contribution
     """
-    # Complex exponential powers of alpha
-    cexp_2i_alpha = cexp_i_alpha * cexp_i_alpha
-    cexp_3i_alpha = cexp_i_alpha * cexp_2i_alpha
-    cexp_4i_alpha = cexp_i_alpha * cexp_3i_alpha
-    cexp_mi_alpha = 1.0 / cexp_i_alpha
-    cexp_m2i_alpha = cexp_mi_alpha * cexp_mi_alpha
-    cexp_m3i_alpha = cexp_mi_alpha * cexp_m2i_alpha
-    cexp_m4i_alpha = cexp_mi_alpha * cexp_m3i_alpha
-
-    # shape (9, N): rows indexed by m+4 for m in -4..4
-    cexp_im_alpha_l4 = jnp.stack(
-        [
-            cexp_m4i_alpha,
-            cexp_m3i_alpha,
-            cexp_m2i_alpha,
-            cexp_mi_alpha,
-            jnp.ones_like(cexp_i_alpha),
-            cexp_i_alpha,
-            cexp_2i_alpha,
-            cexp_3i_alpha,
-            cexp_4i_alpha,
-        ],
-        axis=0,
-    )
-
-    Y4mA = jnp.array(
-        [
-            compute_sminus2_l4(theta=theta_JN, m=-4),
-            compute_sminus2_l4(theta=theta_JN, m=-3),
-            compute_sminus2_l4(theta=theta_JN, m=-2),
-            compute_sminus2_l4(theta=theta_JN, m=-1),
-            compute_sminus2_l4(theta=theta_JN, m=0),
-            compute_sminus2_l4(theta=theta_JN, m=1),
-            compute_sminus2_l4(theta=theta_JN, m=2),
-            compute_sminus2_l4(theta=theta_JN, m=3),
-            compute_sminus2_l4(theta=theta_JN, m=4),
-        ]
-    )
-
-    # Wigner-d coefficients for m'=4 – shape (9, N)
+    b = beta_powers
+    ylm = [compute_sminus2_l4(theta=theta_JN, m=m) for m in range(-4, 5)]
     sqrt2 = jnp.sqrt(2.0)
     sqrt7 = jnp.sqrt(7.0)
     sqrt14 = jnp.sqrt(14.0)
     sqrt70 = jnp.sqrt(70.0)
-
-    d44 = jnp.array(
-        [
-            beta_powers.sBetah8,
-            2.0 * sqrt2 * beta_powers.cBetah * beta_powers.sBetah7,
-            2.0 * sqrt7 * beta_powers.cBetah2 * beta_powers.sBetah6,
-            2.0 * sqrt14 * beta_powers.cBetah3 * beta_powers.sBetah5,
-            sqrt70 * beta_powers.cBetah4 * beta_powers.sBetah4,
-            2.0 * sqrt14 * beta_powers.cBetah5 * beta_powers.sBetah3,
-            2.0 * sqrt7 * beta_powers.cBetah6 * beta_powers.sBetah2,
-            2.0 * sqrt2 * beta_powers.cBetah7 * beta_powers.sBetah,
-            beta_powers.cBetah8,
-        ]
-    )
-
+    # Wigner-d coefficients d^4_{m,4}, m = -4..4
+    d44 = [
+        b.sBetah8,
+        2.0 * sqrt2 * b.cBetah * b.sBetah7,
+        2.0 * sqrt7 * b.cBetah2 * b.sBetah6,
+        2.0 * sqrt14 * b.cBetah3 * b.sBetah5,
+        sqrt70 * b.cBetah4 * b.sBetah4,
+        2.0 * sqrt14 * b.cBetah5 * b.sBetah3,
+        2.0 * sqrt7 * b.cBetah6 * b.sBetah2,
+        2.0 * sqrt2 * b.cBetah7 * b.sBetah,
+        b.cBetah8,
+    ]
     # Exploit symmetry d^4_{-m,-4} = (-1)^m d^4_{m,4}. See eq. A2 of Precessing paper.
-    d4m4 = jnp.array(
-        [d44[8], -d44[7], d44[6], -d44[5], d44[4], -d44[3], d44[2], -d44[1], d44[0]]
-    )
-
-    # Vectorised sum over m=-4..4.  The -m+4 index pattern equals reversed order.
-    A4m4emm = cexp_im_alpha_l4[::-1] * d4m4 * Y4mA[:, None]
-    A44emmstar = cexp_im_alpha_l4 * d44 * jnp.conj(Y4mA)[:, None]
-    hp_sum = jnp.sum(A4m4emm + A44emmstar, axis=0)
-    hc_sum = jnp.sum(1j * (A4m4emm - A44emmstar), axis=0)
-
-    return hp_sum, hc_sum
+    d4m4 = [d44[8], -d44[7], d44[6], -d44[5], d44[4], -d44[3], d44[2], -d44[1], d44[0]]
+    return _twist_sum(_cexp_im_alpha(cexp_i_alpha, 4), ylm, d44, d4m4, ell_odd=False)
 
 
 def apply_polarization_rotation(
@@ -970,13 +935,18 @@ class IMRPhenomXPHM(FrequencyDomainWaveform, DistanceScaledWaveform):
     f_ref: float
     msa_fallback: bool
 
-    def __init__(self, f_ref: float = 20.0, msa_fallback: bool = True) -> None:
+    def __init__(
+        self,
+        f_ref: float = 20.0,
+        msa_fallback: bool = True,
+    ) -> None:
         """
         Args:
             f_ref (float): Reference frequency in Hz. Defaults to 20.0.
             msa_fallback (bool): Matches LAL: on MSA_ERROR, use the NNLO angles
                 (PrecVersion 102), as LAL does for its default PrecVersion 223.
-                Defaults to True; False uses the MSA angles for every binary.
+                Selected per binary with jnp.where (under jax.vmap both branches
+                run). Defaults to True; False uses the MSA angles for every binary.
         """
         self.f_ref = f_ref
         self.msa_fallback = msa_fallback

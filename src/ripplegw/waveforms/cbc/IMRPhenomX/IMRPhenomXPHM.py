@@ -96,6 +96,7 @@ def generate_xphm(
     frequency_array: Float[Array, " n_freq"],
     reference_frequency: float,
     msa_fallback: bool = True,
+    precision: str = "float64",
 ) -> tuple[Complex[Array, " n_freq"], Complex[Array, " n_freq"]]:
     """Generate IMRPhenomXPHM plus and cross polarizations.
 
@@ -105,9 +106,41 @@ def generate_xphm(
             (PrecVersion 102) instead of the MSA angles (PrecVersion 223); see
             IMRPhenomX_NNLO.  Both branches are evaluated and selected per
             binary with jnp.where, so under jax.vmap the NNLO branch runs for
-            every binary.  Default True; False gives the MSA angles for every
-            binary (ripple's behaviour before the fallback).
+            every binary (7-17 % slower on a GPU); for batches,
+            IMRPhenomXPHM_stages.generate_xphm_batch evaluates it only for the
+            MSA_ERROR binaries.  Default True; False gives the MSA angles for
+            every binary (ripple's behaviour before the fallback).
+        precision: "float64" (default; exact, in the dtype of the inputs),
+            "mixed" (per-binary setup and precession angles in float64,
+            per-frequency modes and twist-up in float32; needs jax_enable_x64)
+            or "float32". "mixed" and "float32" run
+            IMRPhenomXPHM_stages.generate_xphm_staged and return complex64.
+
+    Interpolated precession angles are only available for batches, through
+    IMRPhenomXPHM_stages.generate_xphm_batch.
     """
+    if precision != "float64":
+        from ripplegw.waveforms.cbc.IMRPhenomX.IMRPhenomXPHM_stages import (
+            generate_xphm_staged,
+        )
+
+        return generate_xphm_staged(
+            mass_1,
+            mass_2,
+            chi1x,
+            chi1y,
+            chi1z,
+            chi2x,
+            chi2y,
+            chi2z,
+            distance,
+            inclination,
+            phi0,
+            frequency_array,
+            reference_frequency,
+            precision=precision,
+            msa_fallback=msa_fallback,
+        )
     # LAL: Mf = pWF->M_sec * f with M_sec built from round-tripped solar masses;
     # the ULP matters because Mf feeds the near-degenerate MSA S^2 cubic.
     Mf: Float[Array, " n_freq"] = frequency_array * lal_M_sec(mass_1, mass_2)
@@ -356,8 +389,8 @@ def precession_angles(
     """(theta_JN, zeta, alpha, epsilon, cos_beta) for emm = 1..4, shapes (4, N).
 
     MSA angles, exact (default) or interpolated from ``angle_interp_nodes``
-    nodes (pPrec.compute_evolved_spin_interpolated, approximate; meant for
-    batched generation with a fallback for irregular binaries). Where the MSA system fails
+    nodes (pPrec.compute_evolved_spin_interpolated, approximate; used by
+    IMRPhenomXPHM_stages.generate_xphm_batch only). Where the MSA system fails
     and ``msa_fallback`` is set, the NNLO frame and angles replace them.
     """
     # Compute precession angles for all 4 unique emm values in a single batched call.
@@ -942,11 +975,13 @@ class IMRPhenomXPHM(FrequencyDomainWaveform, DistanceScaledWaveform):
 
     f_ref: float
     msa_fallback: bool
+    precision: str
 
     def __init__(
         self,
         f_ref: float = 20.0,
         msa_fallback: bool = True,
+        precision: str = "float64",
     ) -> None:
         """
         Args:
@@ -954,10 +989,15 @@ class IMRPhenomXPHM(FrequencyDomainWaveform, DistanceScaledWaveform):
             msa_fallback (bool): Matches LAL: on MSA_ERROR, use the NNLO angles
                 (PrecVersion 102), as LAL does for its default PrecVersion 223.
                 Selected per binary with jnp.where (under jax.vmap both branches
-                run). Defaults to True; False uses the MSA angles for every binary.
+                run; for batches see IMRPhenomXPHM_stages.generate_xphm_batch).
+                Defaults to True; False uses the MSA angles for every binary.
+            precision (str): "float64" (default, exact), "mixed" or "float32";
+                see generate_xphm. Interpolated precession angles are only
+                offered for batches (IMRPhenomXPHM_stages.generate_xphm_batch).
         """
         self.f_ref = f_ref
         self.msa_fallback = msa_fallback
+        self.precision = precision
 
     @property
     def parameter_names(self) -> tuple[str, ...]:
@@ -1006,8 +1046,12 @@ class IMRPhenomXPHM(FrequencyDomainWaveform, DistanceScaledWaveform):
             frequency,
             self.f_ref,
             msa_fallback=self.msa_fallback,
+            precision=self.precision,
         )
         return {"p": hp, "c": hc}
 
     def __repr__(self):
-        return f"IMRPhenomXPHM(f_ref={self.f_ref}, msa_fallback={self.msa_fallback})"
+        args = f"f_ref={self.f_ref}, msa_fallback={self.msa_fallback}"
+        if self.precision != "float64":
+            args += f", precision={self.precision!r}"
+        return f"IMRPhenomXPHM({args})"

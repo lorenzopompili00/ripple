@@ -351,17 +351,25 @@ def precession_angles(
     zeta_polarisations: FloatLike,
     msa_setup: pPrec.MSAPrecessionSetup,
     msa_fallback: bool = True,
+    angle_interp_nodes: int | None = None,
 ) -> tuple:
     """(theta_JN, zeta, alpha, epsilon, cos_beta) for emm = 1..4, shapes (4, N).
 
-    MSA angles. Where the MSA system fails and ``msa_fallback`` is set, the
-    NNLO frame and angles replace them.
+    MSA angles, exact (default) or interpolated from ``angle_interp_nodes``
+    nodes (pPrec.compute_evolved_spin_interpolated, approximate; meant for
+    batched generation with a fallback for irregular binaries). Where the MSA system fails
+    and ``msa_fallback`` is set, the NNLO frame and angles replace them.
     """
     # Compute precession angles for all 4 unique emm values in a single batched call.
     # Modes 22 and 32 share emm=2, so we only need emm = 1, 2, 3, 4.
-    _batched_angles = jax.vmap(
-        pPrec.compute_evolved_spin_given_setup, in_axes=(None, 0, None)
-    )(Mf, jnp.array([1, 2, 3, 4]), msa_setup)
+    if angle_interp_nodes is None:
+        _batched_angles = jax.vmap(
+            pPrec.compute_evolved_spin_given_setup, in_axes=(None, 0, None)
+        )(Mf, jnp.array([1, 2, 3, 4]), msa_setup)
+    else:
+        _batched_angles = pPrec.compute_evolved_spin_interpolated(
+            Mf, (1, 2, 3, 4), msa_setup, angle_interp_nodes
+        )
     # _batched_angles is a tuple of 3 arrays, each shape (4, N_freq)
     alpha_all = _batched_angles[0]  # (4, N)
     eps_all = _batched_angles[1]  # (4, N)

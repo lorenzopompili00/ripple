@@ -716,29 +716,11 @@ def compute_msa_precession_setup(
     )
 
 
-def compute_evolved_spin_given_setup(
+def _vangles_given_setup(
     Mf: Float[Array, " n_freq"] | FloatLike, emm: int | Array, setup: MSAPrecessionSetup
 ) -> tuple[Float[Array, " n_freq"], Float[Array, " n_freq"], Float[Array, " n_freq"]]:
-    """Compute precession angles for mode emm using pre-computed MSA setup.
-
-    This is the emm-dependent part of compute_evolved_spin_using_msa.
-    Suitable for use inside jax.vmap over harmonic modes.
-
-    Args:
-        Mf: Dimensionless frequency array.
-        emm: Azimuthal mode number m.
-        setup: Pre-computed MSAPrecessionSetup from compute_msa_precession_setup.
-
-    Returns:
-        alpha, epsilon, cos_beta arrays over Mf.
-    """
-    # Zero the angles beyond the largest possible twist cutoff (fCutDef = 0.33
-    # for chiEff > 0.99; 0.3 otherwise — see mf_twist_cutoff).  This mask only
-    # guards against pathological MSA values leaking into the strain via 0*NaN;
-    # the waveform-level mask (Mf <= mf_twist_cutoff(...)) sets the actual LAL
-    # cutoff, so this one must never be *tighter* than it.
-    inspiral_mask = Mf <= 0.33
-    vangles = compute_vangles(
+    """Raw MSA angles (phiz, zeta, cos_theta_L) from compute_vangles, unpacking ``setup``."""
+    return compute_vangles(
         Mf=Mf,
         emm=emm,
         eta=setup.eta,
@@ -784,6 +766,31 @@ def compute_evolved_spin_given_setup(
         Omegazeta5_coeff=setup.Omegazeta5_coeff,
         zeta_0=setup.zeta_0,
     )
+
+
+def compute_evolved_spin_given_setup(
+    Mf: Float[Array, " n_freq"] | FloatLike, emm: int | Array, setup: MSAPrecessionSetup
+) -> tuple[Float[Array, " n_freq"], Float[Array, " n_freq"], Float[Array, " n_freq"]]:
+    """Compute precession angles for mode emm using pre-computed MSA setup.
+
+    This is the emm-dependent part of compute_evolved_spin_using_msa.
+    Suitable for use inside jax.vmap over harmonic modes.
+
+    Args:
+        Mf: Dimensionless frequency array.
+        emm: Azimuthal mode number m.
+        setup: Pre-computed MSAPrecessionSetup from compute_msa_precession_setup.
+
+    Returns:
+        alpha, epsilon, cos_beta arrays over Mf.
+    """
+    # Zero the angles beyond the largest possible twist cutoff (fCutDef = 0.33
+    # for chiEff > 0.99; 0.3 otherwise — see mf_twist_cutoff).  This mask only
+    # guards against pathological MSA values leaking into the strain via 0*NaN;
+    # the waveform-level mask (Mf <= mf_twist_cutoff(...)) sets the actual LAL
+    # cutoff, so this one must never be *tighter* than it.
+    inspiral_mask = Mf <= 0.33
+    vangles = _vangles_given_setup(Mf, emm, setup)
     alpha_out: FloatLike = jnp.where(
         inspiral_mask, vangles[0] - setup.alpha_offset, 0.0
     )
@@ -792,6 +799,123 @@ def compute_evolved_spin_given_setup(
     )
     cos_beta_out: FloatLike = jnp.where(inspiral_mask, vangles[2], 0.0)
     return alpha_out, epsilon_out, cos_beta_out
+
+
+def _cubic_lagrange_uniform(
+    nodes: Float[Array, " n_nodes"], t: Float[Array, "..."]
+) -> Float[Array, "..."]:
+    """Four-point (cubic) Lagrange interpolation of ``nodes`` given on a uniform grid.
+
+    ``t`` is the fractional node index (0 <= t <= n_nodes - 1). Cubic between the
+    four nearest nodes, so the error falls as (node spacing)^4 for smooth data.
+    """
+    n = nodes.shape[0]
+    i0 = jnp.clip(jnp.floor(t).astype(jnp.int32) - 1, 0, n - 4)
+    s = t - i0
+    w0 = -(s - 1.0) * (s - 2.0) * (s - 3.0) / 6.0
+    w1 = s * (s - 2.0) * (s - 3.0) / 2.0
+    w2 = -s * (s - 1.0) * (s - 3.0) / 2.0
+    w3 = s * (s - 1.0) * (s - 2.0) / 6.0
+    return w0 * nodes[i0] + w1 * nodes[i0 + 1] + w2 * nodes[i0 + 2] + w3 * nodes[i0 + 3]
+
+
+def _interpolation_nodes(
+    Mf: Float[Array, " n_freq"], emms: tuple[int, ...], n_nodes: int
+) -> tuple[FloatLike, FloatLike, Float[Array, " n_nodes"]]:
+    """Log-uniform nodes in x = 2 Mf / emm covering every (Mf > 0, emm) below Mf = 0.33.
+
+    Only positive frequencies set the range (a grid may contain f = 0 or
+    negative bins, which would otherwise make log(x) infinite).
+    Returns (u_lo, du, x_nodes) with x_nodes = exp(u_lo + du * k), k = 0..n_nodes-1.
+    """
+    mf_pos_min = jnp.min(jnp.where(Mf > 0, Mf, jnp.inf))
+    x_hi = 2.0 / min(emms) * jnp.minimum(jnp.max(Mf), 0.33)
+    x_lo = jnp.minimum(2.0 / max(emms) * mf_pos_min, x_hi)
+    u_lo = jnp.log(x_lo)
+    du = jnp.maximum(jnp.log(x_hi) - u_lo, 1e-12) / (n_nodes - 1)
+    return u_lo, du, jnp.exp(u_lo + du * jnp.arange(n_nodes, dtype=Mf.dtype))
+
+
+def angle_node_irregularity(
+    Mf: Float[Array, " n_freq"],
+    emms: tuple[int, ...],
+    setup: MSAPrecessionSetup,
+    n_nodes: int,
+) -> FloatLike:
+    """Largest second difference (rad) of the unwrapped alpha and epsilon node values.
+
+    A cheap per-binary indicator that compute_evolved_spin_interpolated cannot
+    be trusted: the angles change too fast or too irregularly for the node
+    spacing (fast precession, near-degenerate MSA roots, MSA_ERROR systems).
+    Used with a threshold (about 1 rad) to send such binaries to the exact path;
+    compare as ``~(irregularity <= threshold)`` so that NaN counts as irregular.
+    """
+    _, _, x_nodes = _interpolation_nodes(Mf, emms, n_nodes)
+    phiz, zeta, _ = _vangles_given_setup(x_nodes, 2, setup)
+
+    def d2(y):
+        y = jnp.unwrap(y)
+        return jnp.max(jnp.abs(y[2:] - 2.0 * y[1:-1] + y[:-2]))
+
+    return jnp.maximum(d2(phiz), d2(zeta))
+
+
+def compute_evolved_spin_interpolated(
+    Mf: Float[Array, " n_freq"],
+    emms: tuple[int, ...],
+    setup: MSAPrecessionSetup,
+    n_nodes: int,
+) -> tuple[
+    Float[Array, "n_emm n_freq"],
+    Float[Array, "n_emm n_freq"],
+    Float[Array, "n_emm n_freq"],
+]:
+    """Approximate precession angles for several emm from one coarse MSA evaluation.
+
+    The MSA angles of mode emm depend on frequency only through the orbital
+    frequency x = 2 * Mf / emm (v = (pi * x)^(1/3) in compute_vangles). They are
+    smooth in x, so they are evaluated once on ``n_nodes`` points uniformly spaced
+    in log(x), covering every (Mf, emm) pair below the Mf = 0.33 mask, and
+    interpolated (cubic) to all requested frequencies and modes; alpha and
+    epsilon are unwrapped on the nodes, so they may differ from the exact path by
+    multiples of 2 pi (irrelevant for the waveform). This is the same
+    idea as LAL's multibanding of the precession angles (an approximation with a
+    controllable error); the exact path is compute_evolved_spin_given_setup.
+
+    Args:
+        Mf: Dimensionless frequency array (any order). Bins with Mf <= 0 get the
+            (finite) lowest-node values; the node range is set by Mf > 0 only.
+        emms: Azimuthal mode numbers, e.g. (1, 2, 3, 4).
+        setup: Pre-computed MSAPrecessionSetup from compute_msa_precession_setup.
+        n_nodes: Number of interpolation nodes (>= 4). More nodes, smaller error.
+
+    Returns:
+        alpha, epsilon, cos_beta arrays of shape (len(emms), len(Mf)), masked
+        above Mf = 0.33 like compute_evolved_spin_given_setup.
+    """
+    if n_nodes < 4:
+        raise ValueError(f"n_nodes must be >= 4, got {n_nodes}")
+    emm_arr = jnp.asarray(emms, dtype=Mf.dtype)[:, None]
+    inspiral_mask = Mf <= 0.33
+    x = 2.0 * Mf[None, :] / emm_arr
+    u_lo, du, x_nodes = _interpolation_nodes(Mf, emms, n_nodes)
+    # emm = 2 gives v = cbrt(pi * x) exactly (2.0 / 2 == 1.0)
+    phiz, zeta, cos_theta_L = _vangles_given_setup(x_nodes, 2, setup)
+    # phiz and zeta can jump by 2 pi between nodes; the twist-up only uses
+    # exp(i k alpha), exp(-i k epsilon) with integer k, so unwrapping is exact there.
+    phiz = jnp.unwrap(phiz)
+    zeta = jnp.unwrap(zeta)
+    # Bins with Mf <= 0 get the lowest-node values (log would be -inf or NaN).
+    log_x = jnp.log(jnp.where(x > 0, x, 1.0))
+    t = jnp.where(x > 0, jnp.clip((log_x - u_lo) / du, 0.0, n_nodes - 1.0), 0.0)
+    alpha = _cubic_lagrange_uniform(phiz, t) - setup.alpha_offset
+    epsilon = _cubic_lagrange_uniform(zeta, t) - setup.epsilon_offset
+    cos_beta = _cubic_lagrange_uniform(cos_theta_L, t)
+    return (
+        jnp.where(inspiral_mask, alpha, 0.0),
+        jnp.where(inspiral_mask, epsilon, 0.0),
+        jnp.where(inspiral_mask, cos_beta, 0.0),
+    )
 
 
 def mf_twist_cutoff(

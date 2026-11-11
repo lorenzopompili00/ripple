@@ -19,6 +19,32 @@ amp_eqspin_indx = 8
 amp_uneqspin_indx = 36
 
 
+def _weighted(x: Array, weight: Array) -> Array:
+    """``x * weight`` for a region weight (a product of heavisides: 0, 1/4, 1/2 or 1),
+    and 0 where the weight is 0 even if ``x`` is not finite there.
+
+    Each region's ansatz (inspiral, intermediate, merger-ringdown) is evaluated at every
+    frequency and weighted by its region. Outside its region an ansatz can be infinite
+    (the intermediate amplitude 1 / polynomial(Mf) where the polynomial vanishes; in
+    float32 that happens to a grid point for about 3 in 1e6 binaries), and inf * 0 would
+    make the sum NaN. Inside the regions the result is unchanged (the weights are powers
+    of two, so the products are exact).
+    """
+    return jnp.where(weight == 0, 0.0, x * weight)
+
+
+def _ratio_or_inf(num: Array, den: Array) -> Array:
+    """``num / den``, inf where that is not finite, with a finite gradient there.
+
+    Where ``num / den`` overflows or divides by zero (an ansatz outside its region, see
+    _weighted) the value is inf, as the division would give (or NaN for 0 / 0); its
+    gradient is 0 instead of NaN, so that a region weight of 0 (_weighted) also stops
+    the gradient (double where: the division is evaluated at den = 1 there).
+    """
+    finite = jnp.isfinite(num / den)
+    return jnp.where(finite, num / jnp.where(finite, den, 1.0), jnp.inf)
+
+
 def get_inspiral_phase(
     fM_s: Float[Array, " n_freq"] | FloatLike,
     theta: Float[Array, "4"],
@@ -837,13 +863,16 @@ def Phase(
     phi_MRD_corrected = phi_MRD + beta0 + beta1 * fM_s
 
     phase = (1 / eta) * (
-        phi_Ins * jnp.heaviside(f1_Ms - fM_s, 0.5)
-        + jnp.heaviside(fM_s - f1_Ms, 0.5)
-        * phi_Int_corrected
-        * jnp.heaviside(f2_Ms - fM_s, 0.5)
-        + phi_MRD_corrected
-        * jnp.heaviside(fM_s - f2_Ms, 0.5)
-        * jnp.heaviside(IMRPhenomX_utils.fM_CUT - fM_s, 0.5)
+        _weighted(phi_Ins, jnp.heaviside(f1_Ms - fM_s, 0.5))
+        + _weighted(
+            phi_Int_corrected,
+            jnp.heaviside(fM_s - f1_Ms, 0.5) * jnp.heaviside(f2_Ms - fM_s, 0.5),
+        )
+        + _weighted(
+            phi_MRD_corrected,
+            jnp.heaviside(fM_s - f2_Ms, 0.5)
+            * jnp.heaviside(IMRPhenomX_utils.fM_CUT - fM_s, 0.5),
+        )
     )
 
     return phase
@@ -1353,8 +1382,9 @@ def get_intermediate_Amp(
         - F1mF22 * (FMs1 + 2 * FMs2 - 3 * FMs4) * V4
     ) / (F1mF22 * F1mF43 * F2mF42)
 
-    Amp_Int = (fM_s ** (7.0 / 6.0)) / (
-        delta0 + fM_s * (delta1 + fM_s * (delta2 + fM_s * (delta3 + fM_s * delta4)))
+    Amp_Int = _ratio_or_inf(
+        fM_s ** (7.0 / 6.0),
+        delta0 + fM_s * (delta1 + fM_s * (delta2 + fM_s * (delta3 + fM_s * delta4))),
     )
 
     return Amp_Int
@@ -1477,13 +1507,17 @@ def Amp(
     )
 
     Amp = (
-        Amp_Ins * jnp.heaviside(fMs_AmpMatchIN - fM_s, 0.5)
-        + jnp.heaviside(fM_s - fMs_AmpMatchIN, 0.5)
-        * Amp_Int
-        * jnp.heaviside(fMs_AmpRDMin - fM_s, 0.5)
-        + Amp_RD
-        * jnp.heaviside(fM_s - fMs_AmpRDMin, 0.5)
-        * jnp.heaviside(IMRPhenomX_utils.fM_CUT - fM_s, 0.5)
+        _weighted(Amp_Ins, jnp.heaviside(fMs_AmpMatchIN - fM_s, 0.5))
+        + _weighted(
+            Amp_Int,
+            jnp.heaviside(fM_s - fMs_AmpMatchIN, 0.5)
+            * jnp.heaviside(fMs_AmpRDMin - fM_s, 0.5),
+        )
+        + _weighted(
+            Amp_RD,
+            jnp.heaviside(fM_s - fMs_AmpRDMin, 0.5)
+            * jnp.heaviside(IMRPhenomX_utils.fM_CUT - fM_s, 0.5),
+        )
     )
 
     return Overallamp * Amp * (fM_s ** (-7.0 / 6.0))

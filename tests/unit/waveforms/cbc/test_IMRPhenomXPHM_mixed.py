@@ -12,7 +12,11 @@ two MSA_ERROR draws) against the stored 24fc1a1 float64 outputs:
   exactly the irregular box draw flagged (MSA_ERROR draws are not), no
   overflow; its MSA_ERROR rows equal those of the overflow path.
 
-``slow``: batch float64 with the default K (overflow) = generate_xphm,
+Region sums of the aligned-spin (2,2) mode: an ansatz infinite outside its region
+gives a finite amplitude and phase (float64, float32, split), with a finite gradient.
+
+``slow``: a binary whose float32 intermediate amplitude is 1 / 0 at a grid point gives
+a finite "mixed" waveform; batch float64 with the default K (overflow) = generate_xphm,
 interpolation overflow path, per-binary "mixed", float32 batch, jaxpr check of
 the float32 stages. ``gpu``: the 12288-draw validation of the fast setting on
 the full multibanded grid.
@@ -147,6 +151,101 @@ def test_nnlo_rows_equal_nnlo_overflow(mixed_exact, mixed_fast):
     err = reference()["msa_error"]
     for a, b in zip(mixed_fast[:2], mixed_exact[:2]):
         assert max_rel_diff(np.asarray(a)[err], np.asarray(b)[err]) < 1e-5
+
+
+def test_region_weight_and_ratio_helpers():
+    """_weighted gives 0 where the region weight is 0, whatever the ansatz there;
+    _ratio_or_inf gives inf for 1 / 0 with a gradient that _weighted stops (0, not
+    NaN)."""
+    import ripplegw.waveforms.cbc.IMRPhenomX.IMRPhenomXAS as xas
+
+    x = jnp.array([jnp.inf, 2.0, 3.0, jnp.nan, 5.0])
+    w = jnp.array([0.0, 1.0, 0.5, 0.0, 0.25])
+    np.testing.assert_array_equal(xas._weighted(x, w), [0.0, 2.0, 1.5, 0.0, 1.25])
+    num, den = jnp.array([1.0, 3.0]), jnp.array([2.0, 0.0])
+    np.testing.assert_array_equal(xas._ratio_or_inf(num, den), [0.5, jnp.inf])
+    loss = lambda n, d: jnp.sum(
+        xas._weighted(xas._ratio_or_inf(n, d), jnp.array([1.0, 0.0]))
+    )
+    dn, dd = jax.grad(loss, argnums=(0, 1))(num, den)
+    np.testing.assert_array_equal(dn, [0.5, 0.0])
+    np.testing.assert_array_equal(dd, [-0.25, 0.0])
+
+
+@pytest.mark.parametrize("precision", ["float64", "float32", "split"])
+def test_aligned_amplitude_and_phase_ignore_a_diverging_ansatz(monkeypatch, precision):
+    """The aligned-spin (2,2) amplitude and phase (IMRPhenomXAS Amp and Phase, the
+    co-precessing (2,2) mode of XPHM) stay finite when a region's ansatz is infinite
+    outside its region (the intermediate amplitude at low frequencies, the inspiral
+    phase at high frequencies), in float64, float32 and the float64 / float32 split."""
+    import ripplegw.waveforms.cbc.IMRPhenomX.IMRPhenomX_utils as utils
+    import ripplegw.waveforms.cbc.IMRPhenomX.IMRPhenomXAS as xas
+
+    amp_int, ins_phase = xas.get_intermediate_Amp, xas.get_inspiral_phase
+    monkeypatch.setattr(
+        xas,
+        "get_intermediate_Amp",
+        lambda fM, *a: jnp.where(fM < 0.005, jnp.inf, amp_int(fM, *a)),
+    )
+    monkeypatch.setattr(
+        xas,
+        "get_inspiral_phase",
+        lambda fM, *a: jnp.where(fM > 0.08, jnp.inf, ins_phase(fM, *a)),
+    )
+    f = jnp.linspace(10.0, 500.0, 64)  # Mf 0.0025-0.12 at M = 50 Msun
+    theta = jnp.array([30.0, 20.0, 0.3, -0.2])
+    for fn, coeffs in (
+        (xas.Amp, utils.PhenomX_amp_coeff_table),
+        (xas.Phase, utils.PhenomX_phase_coeff_table),
+    ):
+        if precision == "split":
+            g = mp.split_by_frequency(lambda x, t, fn=fn: fn(x, *t), f, (theta, coeffs))
+            out = g(f, (theta, coeffs))
+        else:
+            out = mp.run_in(64 if precision == "float64" else 32, fn, f, theta, coeffs)
+        assert np.all(np.isfinite(np.asarray(out))), (fn.__name__, precision)
+
+
+@pytest.mark.slow
+def test_mixed_finite_where_float32_intermediate_amplitude_diverges(monkeypatch):
+    """A precessing binary (q ~ 0.37) whose co-precessing (2,2) intermediate amplitude
+    1 / polynomial(Mf) is 1 / 0 in float32 at 27.125 Hz, an inspiral frequency outside
+    the intermediate region (about 3 in 1e6 box draws have such a grid point on the
+    multibanded grid): "mixed" gives a finite waveform there. Precondition (so that the
+    test cannot pass vacuously if the float32 rounding changes): with the region sums
+    as before (x * weight), the waveform is NaN at that point."""
+    import ripplegw.waveforms.cbc.IMRPhenomX.IMRPhenomXAS as xas
+
+    def mixed():
+        stages._SPLIT_CACHE.clear()  # the split jaxpr is cached per grid shape
+        return stages.generate_xphm_staged(
+            65.38460820979569,
+            24.20576683604144,
+            0.004386422900106385,
+            0.3326009345682458,
+            0.2579636889679578,
+            0.045045695523561746,
+            -0.4480164980632318,
+            0.8662040845148204,
+            100.0,
+            1.48403763197006,
+            2.7834250782436456,
+            jnp.array([20.0, 27.125]),
+            F_REF,
+            precision="mixed",
+        )
+
+    try:
+        hp, hc = mixed()
+        assert np.all(np.isfinite(np.asarray(hp))) and np.all(
+            np.isfinite(np.asarray(hc))
+        )
+        monkeypatch.setattr(xas, "_weighted", lambda x, w: x * w)
+        hp, _ = mixed()
+        assert not np.isfinite(np.asarray(hp)[1]), "the float32 1 / 0 no longer occurs"
+    finally:
+        monkeypatch.undo()
+        stages._SPLIT_CACHE.clear()
 
 
 def test_fallback_max_rows_validation():
